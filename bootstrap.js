@@ -1,9 +1,21 @@
 /* SPDX-License-Identifier: MIT */
 var controllers = new Map();
+var chromeHandle;
 const HTML = 'http://www.w3.org/1999/xhtml';
 const ZOOMS = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8];
 // PDF units are 1/72 inch; standard desktop 100% uses 96 CSS pixels per inch.
 const PDF_TO_CSS = 96 / 72;
+function previewLayout(width,height,screenWidth,screenHeight,barHeight=45){
+  let availableWidth=Math.max(1,screenWidth-36-2);
+  let availableHeight=Math.max(1,screenHeight-36-barHeight-2);
+  let fit=Math.min(1,availableWidth/width,availableHeight/height);
+  return {width:Math.max(1,Math.floor(width*fit)),height:Math.max(1,Math.floor(height*fit)),fit};
+}
+function fitSelection(s,width,height){
+  let naturalWidth=s.w*s.naturalWidth,naturalHeight=s.h*s.naturalHeight;
+  let zoom=Math.min(Math.max(1,width)/naturalWidth,Math.max(1,height)/naturalHeight);
+  return {zoom,width:naturalWidth*zoom,height:naturalHeight*zoom};
+}
 function unwrap(value) { return value?.wrappedJSObject || value; }
 function realmObject(win, values) {
   // PDF.js runs in a different Firefox compartment. Give it objects from its own realm.
@@ -56,7 +68,7 @@ class Lens {
     this.panel.setAttribute('aria-label','选区放大预览');
     this.panel.style.cssText='position:fixed;z-index:2147483646;right:18px;top:18px;width:560px;max-width:calc(100vw - 36px);background:#fff;color:#222;border:1px solid #888;border-radius:8px;box-shadow:0 5px 24px #0006;display:none;overflow:hidden;font:13px sans-serif';
     this.bar=element(this.doc,'div');
-    this.bar.style.cssText='display:flex;align-items:center;gap:6px;padding:7px;background:#f1f3f5;cursor:move;user-select:none;touch-action:none';
+    this.bar.style.cssText='display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:7px;background:#f1f3f5;cursor:move;user-select:none;touch-action:none';
     this.title=element(this.doc,'span','选区放大'); this.title.style.cssText='flex:1';
     this.zoomLabel=element(this.doc,'span');
     this.bar.append(this.title,control(this.doc,'−','减小倍率',()=>owner.zoomBy(-1)),this.zoomLabel,
@@ -67,6 +79,7 @@ class Lens {
     this.canvas=element(this.doc,'canvas'); this.canvas.style.cssText='display:block;max-width:none;';
     this.scroller.append(this.canvas); this.panel.append(this.bar,this.scroller);
     this.doc.body.append(this.shield,this.box,this.panel);
+    this.inlineUI={panel:this.panel,bar:this.bar,scroller:this.scroller,canvas:this.canvas,title:this.title,zoomLabel:this.zoomLabel};
     for (let type of ['pointerdown','mousedown','mouseup','click','dblclick','contextmenu']) {
       this.listen(this.panel,type,e=>e.stopPropagation());
     }
@@ -91,6 +104,7 @@ class Lens {
       }
     },{capture:true,passive:false});
     this.listen(this.bar,'mousedown',e=>{
+      if(this.popup)return;
       if(e.button!==0 || e.target.closest('button'))return;
       this.consume(e); let r=this.panel.getBoundingClientRect();
       this.panelDrag={x:e.clientX-r.left,y:e.clientY-r.top};
@@ -112,7 +126,14 @@ class Lens {
     this.drag=null;this.panelDrag=null;this.box.style.display='none';
     this.shield.style.cursor='grab';
   }
-  hide(){this.cancel();this.abort();this.selection=null;this.panel.style.display='none';}
+  hide(){
+    this.cancel();this.abort();this.selection=null;this.panel.style.display='none';
+    if(this.popup&&!this.popup.closed){
+      let popup=this.popup;this.popup=null;
+      popup.clearTimeout(this.resizeTimer);
+      Object.assign(this,this.inlineUI);popup.close();
+    }
+  }
   point(e,rect){return{x:e.clientX-rect.left,y:e.clientY-rect.top};}
   down(e){
     if(!this.owner.enabled || e.button!==0 || this.panel.contains(e.target))return;
@@ -168,26 +189,111 @@ class Lens {
       let rotation=view?.viewport?.rotation ?? pdf.rotate ?? 0;
       let natural=pdf.getViewport(realmObject(this.win,{scale:PDF_TO_CSS,rotation}));
       this.selection={page:d.page,source:d.source,pdf,rotation,x:c.x/d.rect.width,y:c.y/d.rect.height,w:c.width/d.rect.width,h:c.height/d.rect.height,naturalWidth:natural.width,naturalHeight:natural.height};
-      this.panel.style.display='block';this.refresh();
+      await this.openPreview();
+      if(token!==this.serial || !this.owner.enabled)return;
+      this.panel.style.display='flex';this.refresh();
     }catch(error){this.error(error);}
   }
   position(){
-    this.panel.style.width=Math.min(this.owner.size,this.win.innerWidth-36)+'px';
+    if(this.popup&&!this.popup.closed)return;
+    let s=this.selection;
+    if(s){
+      let width=s.w*s.naturalWidth*this.owner.zoom,height=s.h*s.naturalHeight*this.owner.zoom;
+      let layout=previewLayout(width,height,this.win.innerWidth,this.win.innerHeight,this.bar.getBoundingClientRect().height||45);
+      this.panel.style.width=layout.width+'px';
+      // Measure wrapped controls after setting the width, then account for their height.
+      layout=previewLayout(width,height,this.win.innerWidth,this.win.innerHeight,this.bar.getBoundingClientRect().height||45);
+      this.panel.style.width=layout.width+'px';
+      this.scroller.style.width='100%';this.scroller.style.height=layout.height+'px';
+      this.scroller.style.maxHeight='none';
+    }else this.panel.style.width=Math.min(560,this.win.innerWidth-36)+'px';
     if(this.panel.style.left){let r=this.panel.getBoundingClientRect();this.panel.style.left=Math.max(0,Math.min(r.left,this.win.innerWidth-r.width))+'px';}
-    if(this.panel.style.top){let r=this.panel.getBoundingClientRect();this.panel.style.top=Math.max(0,Math.min(r.top,this.win.innerHeight-45))+'px';}
+    if(this.panel.style.top){let r=this.panel.getBoundingClientRect();this.panel.style.top=Math.max(0,Math.min(r.top,this.win.innerHeight-r.height))+'px';}
   }
   sync(){this.zoomLabel.textContent=Math.round(this.owner.zoom*100)+'%';this.position();}
+  async openPreview(){
+    if(this.popup&&!this.popup.closed)return;
+    let s=this.selection;
+    let main=Zotero.getMainWindow();
+    let screen=main.screen;
+    let layout=previewLayout(s.w*s.naturalWidth*this.owner.zoom,s.h*s.naturalHeight*this.owner.zoom,screen.availWidth,screen.availHeight,75);
+    let width=Math.max(360,layout.width+24),height=Math.max(220,layout.height+90);
+    let popup=main.openDialog('chrome://zotero-magnifier/content/preview.xhtml','',
+      'chrome,dialog=no,resizable=yes,alwaysRaised=yes,centerscreen,width='+width+',height='+height);
+    if(!popup)throw new Error('无法打开独立预览窗口');
+    this.popup=popup;
+    await new Promise((resolve,reject)=>{
+      let timer=main.setTimeout(()=>reject(new Error('独立预览窗口加载超时')),10000);
+      let loaded=()=>{main.clearTimeout(timer);resolve();};
+      if(popup.document.readyState==='complete')loaded();else popup.addEventListener('load',loaded,{once:true});
+    });
+    if(popup.closed || !this.selection || !this.owner.enabled)return;
+    let host=popup.document.getElementById('magnifier-host');
+    if(!host)throw new Error('预览窗口缺少内容容器');
+    // Chrome windows have distinct docgroups: create every node in its destination
+    // document. Moving or adopting reader nodes into this document is unsupported.
+    let doc=popup.document;
+    this.panel=element(doc,'section');this.panel.setAttribute('aria-label','选区放大预览');
+    this.bar=element(doc,'div');
+    this.bar.style.cssText='display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:7px;background:#f1f3f5;user-select:none';
+    this.title=element(doc,'span','选区放大 · 独立倍率');this.title.style.flex='1';
+    this.zoomLabel=element(doc,'span',Math.round(this.owner.zoom*100)+'%');
+    this.bar.append(this.title,control(doc,'−','减小倍率',()=>this.owner.zoomBy(-1)),this.zoomLabel,
+      control(doc,'＋','增大倍率',()=>this.owner.zoomBy(1)),control(doc,'重新框选','关闭预览并重新框选',()=>this.hide()),
+      control(doc,'×','关闭预览',()=>this.hide()));
+    this.scroller=element(doc,'div');this.canvas=element(doc,'canvas');
+    this.canvas.style.cssText='display:block;max-width:none';
+    this.scroller.append(this.canvas);this.panel.append(this.bar,this.scroller);host.append(this.panel);
+    this.panel.style.cssText='display:flex;flex-direction:column;flex:1;min-height:0;width:100%;background:white;color:#222;font:13px sans-serif;overflow:hidden';
+    this.bar.style.cursor='default';
+    this.scroller.style.cssText='display:flex;align-items:center;justify-content:center;flex:1;min-height:0;min-width:0;width:100%;overflow:hidden;background:white';
+    this.canvas.style.maxWidth='none';
+    let onWheel=e=>{if(e.altKey){this.consume(e);this.owner.zoomBy(e.deltaY<0?1:-1);}};
+    let onKey=e=>this.owner.key(e);
+    let onResize=()=>{
+      if(this.popup!==popup || !this.selection)return;
+      this.fitCanvas();
+      popup.clearTimeout(this.resizeTimer);
+      this.resizeTimer=popup.setTimeout(()=>{if(this.popup===popup && this.selection)this.refresh();},100);
+    };
+    popup.addEventListener('wheel',onWheel,{capture:true,passive:false});
+    popup.addEventListener('keydown',onKey,true);
+    popup.addEventListener('resize',onResize);
+    popup.addEventListener('unload',()=>{
+      popup.clearTimeout(this.resizeTimer);popup.removeEventListener('resize',onResize);
+      popup.removeEventListener('wheel',onWheel,true);popup.removeEventListener('keydown',onKey,true);
+      if(this.popup!==popup)return;
+      Object.assign(this,this.inlineUI);this.panel.style.display='none';
+      this.popup=null;this.cancel();this.selection=null;
+    },{once:true});
+    popup.focus();
+  }
+  fitCanvas(){
+    let s=this.selection;if(!s)return;
+    let fitted=fitSelection(s,this.scroller.clientWidth,this.scroller.clientHeight);
+    this.canvas.style.width=fitted.width+'px';this.canvas.style.height=fitted.height+'px';
+    this.zoomLabel.textContent='适应窗口 '+Math.round(fitted.zoom*100)+'%';
+    return fitted;
+  }
+  resizePreview(ratio){
+    let popup=this.popup;if(!popup || popup.closed)return;
+    let screen=popup.screen;
+    let width=Math.min(screen.availWidth,Math.max(360,popup.innerWidth*ratio+(popup.outerWidth-popup.innerWidth)));
+    let height=Math.min(screen.availHeight,Math.max(220,(popup.innerHeight-this.bar.getBoundingClientRect().height)*ratio+this.bar.getBoundingClientRect().height+(popup.outerHeight-popup.innerHeight)));
+    popup.resizeTo(Math.round(width),Math.round(height));
+  }
   refresh(){
     this.sync();if(!this.selection)return;
     this.cancel();let s=this.selection,zoom=this.owner.zoom;
+    if(this.popup&&!this.popup.closed){zoom=this.fitCanvas().zoom;}
     // Limit pixel allocation for very large selections without changing the displayed multiplier.
     let cssWidth=s.w*s.naturalWidth*zoom,cssHeight=s.h*s.naturalHeight*zoom;
-    let dpr=Math.min(this.win.devicePixelRatio||1,2,4096/Math.max(cssWidth,cssHeight),Math.sqrt(16000000/(cssWidth*cssHeight)));
+    let dpr=Math.min(this.popup?.devicePixelRatio||this.win.devicePixelRatio||1,2,4096/Math.max(cssWidth,cssHeight),Math.sqrt(16000000/(cssWidth*cssHeight)));
     this.canvas.width=Math.max(1,Math.round(cssWidth*dpr));this.canvas.height=Math.max(1,Math.round(cssHeight*dpr));
     this.canvas.style.width=cssWidth+'px';this.canvas.style.height=cssHeight+'px';
     let ctx=this.canvas.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,this.canvas.width,this.canvas.height);
     ctx.drawImage(s.source,s.x*s.source.width,s.y*s.source.height,s.w*s.source.width,s.h*s.source.height,0,0,this.canvas.width,this.canvas.height);
-    this.title.textContent='选区放大 · 独立倍率';
+    this.title.textContent='选区放大';
     this.render(s,dpr,zoom,this.serial);
   }
   async render(s,dpr,zoom,token){
@@ -210,16 +316,12 @@ class Controller {
   constructor(reader,doc,append){
     this.reader=reader;this.doc=doc;this.enabled=false;this.lenses=new Map();
     let saved=Number(Zotero.Prefs.get('extensions.zoteroMagnifier.absoluteZoom',true));this.zoom=ZOOMS.includes(saved)?saved:2;
-    this.size=560;
     this.root=element(doc,'div');this.root.style.cssText='display:flex;align-items:center;gap:4px;padding:0 5px;font:12px sans-serif';
     this.button=control(doc,'框选放大','开启后在 PDF 页面拖动框选（Alt+M，Esc 退出）',()=>this.toggle());
     this.button.setAttribute('aria-pressed','false');
     this.label=element(doc,'span');this.label.style.cssText='min-width:30px;text-align:center';
-    this.sizeButton=control(doc,'窗口：中','切换预览窗口宽度：小 / 中 / 大',()=>{
-      let values=[360,560,760];this.size=values[(values.indexOf(this.size)+1)%values.length];this.sync();
-    });
     this.root.append(this.button,control(doc,'−','减小倍率',()=>this.zoomBy(-1)),this.label,
-      control(doc,'＋','增大倍率',()=>this.zoomBy(1)),this.sizeButton);append(this.root);
+      control(doc,'＋','增大倍率',()=>this.zoomBy(1)));append(this.root);
     this.onKey=e=>this.key(e);doc.addEventListener('keydown',this.onKey,true);
     this.onUnload=()=>{this.destroy();controllers.delete(reader);};doc.defaultView.addEventListener('unload',this.onUnload,{once:true});
     this.observer=new doc.defaultView.MutationObserver(()=>this.scan());this.observer.observe(doc.body,{childList:true,subtree:true});
@@ -230,7 +332,7 @@ class Controller {
     for(let [win,lens]of this.lenses)if(!current.has(win)){lens.destroy();this.lenses.delete(win);}
     for(let win of current)if(!this.lenses.has(win))this.lenses.set(win,new Lens(win,this));
   }
-  sync(){this.label.textContent=Math.round(this.zoom*100)+'%';this.label.title='预览独立缩放，不受主页面缩放影响';this.sizeButton.textContent='窗口：'+({360:'小',560:'中',760:'大'}[this.size]);this.lenses.forEach(l=>l.refresh());}
+  sync(){this.label.textContent=Math.round(this.zoom*100)+'%';this.label.title='预览独立缩放，不受主页面缩放影响';this.lenses.forEach(l=>l.refresh());}
   hide(){this.lenses.forEach(l=>l.hide());}
   setHand(enabled){
     let internal=unwrap(this.reader._internalReader);
@@ -248,7 +350,7 @@ class Controller {
     try{this.setHand(this.enabled);}catch(error){Zotero.logError(error);}
     this.button.setAttribute('aria-pressed',String(this.enabled));this.button.style.background=this.enabled?'#4683d933':'transparent';this.hide();this.lenses.forEach(l=>l.mode());
   }
-  zoomBy(delta){let idx=ZOOMS.indexOf(this.zoom);this.zoom=ZOOMS[Math.max(0,Math.min(ZOOMS.length-1,idx+(delta>0?1:-1)))];Zotero.Prefs.set('extensions.zoteroMagnifier.absoluteZoom',this.zoom,true);this.sync();}
+  zoomBy(delta){let previous=this.zoom,idx=ZOOMS.indexOf(this.zoom);this.zoom=ZOOMS[Math.max(0,Math.min(ZOOMS.length-1,idx+(delta>0?1:-1)))];Zotero.Prefs.set('extensions.zoteroMagnifier.absoluteZoom',this.zoom,true);this.lenses.forEach(l=>l.resizePreview(this.zoom/previous));this.sync();}
   key(e){
     if(e.target.closest?.('input,textarea,select,[contenteditable="true"]'))return;
     if((e.altKey&&!e.ctrlKey&&!e.metaKey&&e.code==='KeyM')||(e.key==='Escape'&&this.enabled)){e.preventDefault();e.stopPropagation();this.toggle();}
@@ -256,7 +358,12 @@ class Controller {
   destroy(){if(this.enabled){try{this.setHand(false);}catch(error){Zotero.debug(String(error));}}this.observer.disconnect();this.lenses.forEach(l=>l.destroy());this.lenses.clear();this.doc.removeEventListener('keydown',this.onKey,true);this.doc.defaultView.removeEventListener('unload',this.onUnload);this.root.remove();}
 }
 function toolbar({reader,doc,append}){if(reader.type&&reader.type!=='pdf')return;controllers.get(reader)?.destroy();controllers.set(reader,new Controller(reader,doc,append));}
-async function startup({id}){await Zotero.uiReadyPromise;Zotero.Reader.registerEventListener('renderToolbar',toolbar,id);}
-function shutdown(){Zotero.Reader.unregisterEventListener('renderToolbar',toolbar);controllers.forEach(c=>c.destroy());controllers.clear();}
+async function startup({id,rootURI}){
+  await Zotero.uiReadyPromise;
+  chromeHandle=Cc['@mozilla.org/addons/addon-manager-startup;1'].getService(Ci.amIAddonManagerStartup)
+    .registerChrome(Services.io.newURI(rootURI+'manifest.json'),[['content','zotero-magnifier','content/']]);
+  Zotero.Reader.registerEventListener('renderToolbar',toolbar,id);
+}
+function shutdown(){Zotero.Reader.unregisterEventListener('renderToolbar',toolbar);controllers.forEach(c=>c.destroy());controllers.clear();chromeHandle?.destruct();chromeHandle=null;}
 function install(){}
 function uninstall(){}

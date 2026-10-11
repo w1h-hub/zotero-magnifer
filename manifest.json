@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Zotero Magnifier 放大镜",
-  "version": "0.2.3",
+  "version": "0.3.2",
   "description": "Drag to select a PDF region and magnify it in a floating preview.",
   "author": "Zotero Magnifier contributors",
   "applications": { "zotero": {
